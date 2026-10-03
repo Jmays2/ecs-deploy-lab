@@ -1,0 +1,148 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: ecs-deploy-lab
+  ECS_CLUSTER: ecs-deploy-lab
+  ECS_SERVICE: ecs-deploy-lab
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ------------------------------------------------------------
+      # Checkout
+      # ------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------
+      # AWS authentication via GitHub OIDC
+      # ------------------------------------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ------------------------------------------------------------
+      # Login to ECR
+      # ------------------------------------------------------------
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ------------------------------------------------------------
+      # Build and push application image
+      # ------------------------------------------------------------
+      - name: Build and push image
+        id: image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY"
+          TAG="$GITHUB_SHA"
+
+          echo "Building:"
+          echo "$IMAGE:$TAG"
+
+          docker build \
+            --build-arg VERSION="$GITHUB_SHA" \
+            -t "$IMAGE:$TAG" .
+
+          docker push "$IMAGE:$TAG"
+
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------
+      # Show deployed artifact
+      # ------------------------------------------------------------
+      - name: Show artifact
+        run: |
+          echo "COMMIT: $GITHUB_SHA"
+          echo "IMAGE: ${{ steps.image.outputs.image }}"
+          echo "TAG: ${{ steps.image.outputs.tag }}"
+          echo "DEPLOYED IMAGE: ${{ steps.image.outputs.image }}:${{ steps.image.outputs.tag }}"
+
+      # ------------------------------------------------------------
+      # Create application ECS task definition
+      # ------------------------------------------------------------
+      - name: Create task definition
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity \
+            --query Account \
+            --output text)
+
+          EXECUTION_ROLE="arn:aws:iam::$ACCOUNT_ID:role/${ECS_SERVICE}-ecs-execution"
+          TASK_ROLE="arn:aws:iam::$ACCOUNT_ID:role/${ECS_SERVICE}-ecs-task"
+
+          jq -n \
+            --arg family "$ECS_SERVICE" \
+            --arg image "$IMAGE:$TAG" \
+            --arg region "$AWS_REGION" \
+            --arg log_group "/ecs/$ECS_SERVICE" \
+            --arg execution_role "$EXECUTION_ROLE" \
+            --arg task_role "$TASK_ROLE" \
+            '{
+              family: $family,
+              networkMode: "awsvpc",
+              requiresCompatibilities: ["FARGATE"],
+              cpu: "256",
+              memory: "512",
+
+              executionRoleArn: $execution_role,
+              taskRoleArn: $task_role,
+
+              containerDefinitions: [
+                {
+                  name: "app",
+                  image: $image,
+                  essential: true,
+
+                  portMappings: [
+                    {
+                      containerPort: 8080,
+                      hostPort: 8080,
+                      protocol: "tcp"
+                    }
+                  ],
+
+                  logConfiguration: {
+                    logDriver: "awslogs",
+                    options: {
+                      "awslogs-group": $log_group,
+                      "awslogs-region": $region,
+                      "awslogs-stream-prefix": "app"
+                    }
+                  }
+                }
+              ]
+            }' > task-definition.json
+
+          echo "Generated task definition:"
+          cat task-definition.json
+
+      # ------------------------------------------------------------
+      # Deploy application to ECS
+      # ------------------------------------------------------------
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: task-definition.json
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          desired-count: 1
+          wait-for-service-stability: true
